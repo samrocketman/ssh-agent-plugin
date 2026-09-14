@@ -29,6 +29,7 @@ import org.jvnet.hudson.test.RestartableJenkinsRule;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Scanner;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.regex.Pattern;
 
@@ -298,6 +299,55 @@ public class SSHAgentStepWorkflowTest extends SSHAgentBase {
                 );
                 WorkflowRun b = story.j.buildAndAssertStatus(Result.FAILURE, job);
                 story.j.assertLogContains("Could not find specified credentials", b);
+            }
+        });
+    }
+
+    /**
+     * {@code ssh-agent} must not occupy the CPS VM. Otherwise a parallel sibling
+     * cannot proceed until the agent process is up.
+     */
+    @Test
+    public void sshAgentStartDoesNotBlockCpsVm() {
+        assumeFalse(Functions.isWindows());
+        story.then(r -> {
+            CountDownLatch inStart = new CountDownLatch(1);
+            CountDownLatch release = new CountDownLatch(1);
+            SSHAgentStepExecution.beforeAgentStart = () -> {
+                inStart.countDown();
+                try {
+                    if (!release.await(2, TimeUnit.MINUTES)) {
+                        throw new IllegalStateException("timed out waiting to resume ssh-agent");
+                    }
+                } catch (InterruptedException e) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException(e);
+                }
+            };
+            try {
+                WorkflowJob job = r.jenkins.createProject(WorkflowJob.class, "sshAgentDoesNotBlockCps");
+                job.setDefinition(new CpsFlowDefinition(""
+                        + "node {\n"
+                        + "  parallel(\n"
+                        + "    agent: {\n"
+                        + "      sshagent (credentials: [], ignoreMissing: true) {\n"
+                        + "        echo 'inside sshagent'\n"
+                        + "      }\n"
+                        + "    },\n"
+                        + "    other: {\n"
+                        + "      echo 'other branch ran'\n"
+                        + "    }\n"
+                        + "  )\n"
+                        + "}\n", true));
+                WorkflowRun b = job.scheduleBuild2(0).waitForStart();
+                assertTrue("ssh-agent must start on a background thread", inStart.await(60, TimeUnit.SECONDS));
+                r.waitForMessage("other branch ran", b);
+                release.countDown();
+                r.assertBuildStatusSuccess(r.waitForCompletion(b));
+                r.assertLogContains("inside sshagent", b);
+            } finally {
+                SSHAgentStepExecution.beforeAgentStart = null;
+                release.countDown();
             }
         });
     }
